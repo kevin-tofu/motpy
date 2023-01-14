@@ -147,3 +147,33 @@ class Model:
         center = _zero_pad(x[self.pos_idxs], size)
         length = _zero_pad(x[self.size_idxs], size)
         return np.concatenate((center - length / 2, center + length / 2))
+
+
+class Model_smoother(Model):
+    def __init__(
+            self,
+            dt: float,
+            order_pos: int = 1,
+            dim_pos: int = 2,
+            order_size: int = 0,
+            dim_size: int = 2,
+            q_var_pos: float = 70.0,
+            q_var_size: float = 10.0,
+            r_var_pos: float = 1,
+            r_var_size: float = 1,
+            p_cov_p0: float = 1000., \
+            lag: int = 5):
+
+        super().__init__(
+            dt=dt, \
+            order_pos=order_pos, \
+            dim_pos=dim_pos, \
+            order_size=order_size, \
+            dim_size=dim_size, \
+            q_var_pos=q_var_pos, \
+            q_var_size=q_var_size, \
+            r_var_pos=r_var_pos, \
+            r_var_size=r_var_size, \
+            p_cov_p0=p_cov_p0
+        )
+        self.lag = lag

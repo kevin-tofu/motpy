@@ -6,11 +6,11 @@ from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple, Type,
 
 import numpy as np
 import scipy
-from filterpy.kalman import KalmanFilter
+from filterpy.kalman import KalmanFilter, FixedLagSmoother
 
 from motpy.core import Box, Detection, Track, Vector, setup_logger
 from motpy.metrics import angular_similarity, calculate_iou
-from motpy.model import Model, ModelPreset
+from motpy.model import Model, ModelPreset, Model_smoother
 
 logger = setup_logger(__name__)
 
@@ -32,6 +32,31 @@ def get_kalman_object_tracker(model: Model, x0: Optional[Vector] = None) -> Kalm
     tracker.R = model.build_R()
     tracker.P = model.build_P()
 
+    if x0 is not None:
+        tracker.x = x0
+
+    return tracker
+
+def get_kalmanfixedlag_object_tracker(model: Model, \
+                                      x0: Optional[Vector] = None, \
+                                      lag: int = 5) -> FixedLagSmoother:
+    """ returns Kalman-based tracker based on a specified motion model spec.
+        e.g. for spec = {'order_pos': 1, 'dim_pos': 2, 'order_size': 0, 'dim_size': 1}
+        we expect the following setup:
+        state x, x', y, y', w, h
+        where x and y are centers of boxes
+              w and h are width and height
+    """
+
+    tracker = FixedLagSmoother(dim_x=model.state_length,\
+                               dim_z=model.measurement_length, \
+                               N=lag)
+    tracker.F = model.build_F()
+    tracker.Q = model.build_Q()
+    tracker.H = model.build_H()
+    tracker.R = model.build_R()
+    tracker.P = model.build_P()
+    
     if x0 is not None:
         tracker.x = x0
 
@@ -167,6 +192,119 @@ class KalmanTracker(SingleObjectTracker):
 
     def box(self) -> Box:
         return self.model.x_to_box(self._tracker.x)
+
+    def is_invalid(self) -> bool:
+        try:
+            has_nans = any(np.isnan(self._tracker.x))
+            return has_nans
+        except Exception as e:
+            logger.warning(f'invalid tracker - exception: {e}')
+            return True
+
+
+class KalmanFixedLagTracker(SingleObjectTracker):
+    """ A single object tracker using Kalman filter with specified motion model specification """
+
+    def __init__(self,
+                 model_kwargs: dict = DEFAULT_MODEL_SPEC,
+                 x0: Optional[Vector] = None,
+                 box0: Optional[Box] = None,
+                 **kwargs) -> None:
+
+        super(KalmanFixedLagTracker, self).__init__(**kwargs)
+
+        self.model_kwargs: dict = model_kwargs
+        self.model = Model_smoother(**self.model_kwargs)
+
+        if x0 is None:
+            x0 = self.model.box_to_x(box0)
+
+        print("lag : ", self.model.lag)
+        self.score_list = list()
+        self._tracker: FixedLagSmoother = get_kalmanfixedlag_object_tracker(model=self.model, x0=x0, lag=self.model.lag)
+
+    def _predict(self) -> None:
+        # self._tracker.predict()
+        # Note: smooth function contains prediction step.
+        self._tracker.x_pre = np.dot(self._tracker.F, self._tracker.x)
+        # if u is not None:
+            # self._tracker.x_pre += np.dot(self._tracker.B, self._tracker.u)
+
+    def _update_box(self, detection: Detection) -> None:
+        z = self.model.box_to_z(detection.box)
+        # self._tracker.update(z)
+        # self._tracker.smooth(z)
+
+        k = self._tracker.count
+        self._tracker.P = np.dot(self._tracker.F, self._tracker.P).dot(self._tracker.F.T) + self._tracker.Q
+
+        # update step of normal Kalman filter
+        self._tracker.y = z - np.dot(self._tracker.H, self._tracker.x_pre)
+
+        self._tracker.S = np.dot(self._tracker.H, self._tracker.P).dot(self._tracker.H.T) + self._tracker.R
+        SI = np.linalg.inv(self._tracker.S)
+
+        K = np.dot(self._tracker.P, self._tracker.H.T).dot(SI)
+
+        self._tracker.x = self._tracker.x_pre + np.dot(K, self._tracker.y)
+
+        I_KH = self._tracker._I - np.dot(K, self._tracker.H)
+        self._tracker.P = np.dot(I_KH, self._tracker.P).dot(I_KH.T) + np.dot(K, self._tracker.R).dot(K.T)
+
+        self._tracker.xSmooth.append(self._tracker.x_pre.copy())
+
+        #compute invariants
+        HTSI = np.dot(self._tracker.H.T, SI)
+        F_LH = (self._tracker.F - np.dot(K, self._tracker.H)).T
+
+        if k >= self._tracker.N:
+            PS = self._tracker.P.copy() # smoothed P for step i
+            for i in range(self._tracker.N):
+                K = np.dot(PS, HTSI)  # smoothed gain
+                PS = np.dot(PS, F_LH) # smoothed covariance
+
+                si = k-i
+                self._tracker.xSmooth[si] = self._tracker.xSmooth[si] + np.dot(K, self._tracker.y)
+        else:
+            # Some sources specify starting the fix lag smoother only
+            # after N steps have passed, some don't. I am getting far
+            # better results by starting only at step N.
+            self._tracker.xSmooth[k] = self._tracker.x.copy()
+
+        
+        self._tracker.count += 1
+        # self._tracker.x = x
+        # self._tracker.P = P
+
+    def update(self, detection: Detection) -> None:
+        self._update_box(detection)
+
+        self.steps_positive += 1
+
+        self.class_id = self.update_class_id(detection.class_id)
+        self.score = self.update_score_fn(old=self.score, new=detection.score)
+        self.feature = self.update_feature_fn(old=self.feature, new=detection.feature)
+
+        # self.class_id_list = self.update_class_id(detection.class_id)
+        self.score_list.append(self.score)
+        # self.feature_list = self.update_feature_fn(old=self.feature, new=detection.feature)
+
+        # reduce the staleness of a tracker, faster than growth rate
+        self.unstale(rate=3)
+
+    def box(self, n=0) -> Box:
+        x_ret = self._tracker.x if n == 0 else self._tracker.xSmooth[-(n+1)]
+        return self.model.x_to_box(x_ret)
+    
+    def track_all(self) -> List[Box]:
+        
+        bboxes = [self.model.x_to_box(x_loop) for x_loop in self._tracker.xSmooth]
+        ret = list()
+        for bbox, score in zip(bboxes, self.score_list):
+            ret.append(
+                Track(id=self.id, box=bbox, score=score, class_id=self.class_id)
+            )
+        return ret
 
     def is_invalid(self) -> bool:
         try:
@@ -366,7 +504,7 @@ class MultiObjectTracker:
                       min_steps_alive: int = -1) -> List[Track]:
         """ returns all active tracks after optional filtering by tracker steps count and staleness """
 
-        tracks: List[Track] = []
+        Otracks: List[Track] = []
         for tracker in self.trackers:
             cond1 = tracker.staleness / tracker.steps_positive < max_staleness_to_positive_ratio  # early stage
             cond2 = tracker.staleness < max_staleness
@@ -433,3 +571,109 @@ class MultiObjectTracker:
         logger.debug(f'tracking step time: {elapsed:.3f} ms')
 
         return self.active_tracks(**self.active_tracks_kwargs)
+
+
+class MultiObjectSmoother:
+    def __init__(self, dt: float,
+                 model_spec: Union[str, Dict] = DEFAULT_MODEL_SPEC,
+                 matching_fn: Optional[BaseMatchingFunction] = None,
+                 tracker_kwargs: Dict = None,
+                 matching_fn_kwargs: Dict = None,
+                 active_tracks_kwargs: Dict = None) -> None:
+        """
+            model_spec specifies the dimension and order for position and size of the object
+            matching_fn determines the strategy on which the trackers and detections are assigned.
+
+            tracker_kwargs are passed to each single object tracker
+            active_tracks_kwargs limits surfacing of fresh/fading out tracks
+        """
+
+        self.trackers: List[SingleObjectTracker] = []
+
+        # kwargs to be passed to each single object tracker
+        self.tracker_kwargs: Dict = tracker_kwargs if tracker_kwargs is not None else {}
+        self.tracker_clss: Optional[Type[SingleObjectTracker]] = None
+
+        # translate model specification into single object tracker to be used
+        if isinstance(model_spec, dict):
+            self.tracker_clss = KalmanFixedLagTracker
+            self.tracker_kwargs['model_kwargs'] = model_spec
+            self.tracker_kwargs['model_kwargs']['dt'] = dt
+        
+        else:
+            raise NotImplementedError(f'unsupported motion model {model_spec}')
+
+        logger.debug(f'using single tracker of class: {self.tracker_clss} with kwargs: {self.tracker_kwargs}')
+
+        self.matching_fn: BaseMatchingFunction = matching_fn
+        self.matching_fn_kwargs: Dict = matching_fn_kwargs if matching_fn_kwargs is not None else {}
+        if self.matching_fn is None:
+            self.matching_fn = IOUAndFeatureMatchingFunction(**self.matching_fn_kwargs)
+
+        # kwargs to be used when self.step returns active tracks
+        self.active_tracks_kwargs: Dict = active_tracks_kwargs if active_tracks_kwargs is not None else {}
+        logger.debug('using active_tracks_kwargs: %s' % str(self.active_tracks_kwargs))
+
+        self.detections_matched_ids = []
+
+
+    def cleanup_trackers(self) -> None:
+        count_before = len(self.trackers)
+        non_active_trackers = [t for t in self.trackers if (t.is_stale() or t.is_invalid())]
+        self.trackers = [t for t in self.trackers if not (t.is_stale() or t.is_invalid())]
+        count_after = len(self.trackers)
+        logger.debug('deleted %s/%s trackers' % (count_before - count_after, count_before))
+        return non_active_trackers
+
+
+    def step(self, detections: Sequence[Detection]) -> List[Track]:
+        """ the method matches the new detections with existing trackers,
+        creates new trackers if necessary and performs the cleanup.
+        Returns the active tracks after active filtering applied """
+        t0 = time.time()
+
+        # filter out empty detections
+        detections = [det for det in detections if det.box is not None]
+
+        # predict state in all trackers
+        for t in self.trackers:
+            t.predict()
+        
+        # match trackers with detections
+        logger.debug('step with %d detections' % len(detections))
+        matches = self.matching_fn(self.trackers, detections)
+        logger.debug('matched %d pairs' % len(matches))
+
+        self.detections_matched_ids = [None] * len(detections)
+
+        # assigned trackers: correct
+        for match in matches:
+            track_idx, det_idx = match[0], match[1]
+            self.trackers[track_idx].update(detection=detections[det_idx])
+            self.detections_matched_ids[det_idx] = self.trackers[track_idx].id
+
+        # not assigned detections: create new trackers POF
+        assigned_det_idxs = set(matches[:, 1]) if len(matches) > 0 else []
+        for det_idx in set(range(len(detections))).difference(assigned_det_idxs):
+            det = detections[det_idx]
+            tracker = self.tracker_clss(box0=det.box,
+                                        score0=det.score,
+                                        class_id0=det.class_id,
+                                        **self.tracker_kwargs)
+            self.detections_matched_ids[det_idx] = tracker.id
+            self.trackers.append(tracker)
+
+        # unassigned trackers
+        assigned_track_idxs = set(matches[:, 0]) if len(matches) > 0 else []
+        for track_idx in set(range(len(self.trackers))).difference(assigned_track_idxs):
+            self.trackers[track_idx].stale()
+
+        # cleanup dead trackers
+        non_active_trackers = self.cleanup_trackers()
+
+        # log step timing
+        elapsed = (time.time() - t0) * 1000.
+        logger.debug(f'tracking step time: {elapsed:.3f} ms')
+
+        return non_active_trackers
+        # return self.active_tracks(**self.active_tracks_kwargs)
