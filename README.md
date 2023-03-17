@@ -1,6 +1,9 @@
-# motpy - simple multi object tracking library
+# motpy-smoother - simple multi object tracking library
 
 Project is meant to provide a simple yet powerful baseline for multiple object tracking without the hassle of writing the obvious algorithm stack yourself.
+The original repository is here. <https://github.com/wmuron/motpy>  
+This is a forked projectry from the above project. The difference between this repo and original is that this repo is including KalmanSmoother which is assuming not real-time processin to get fine results.
+See smooth_coco_video.py as example.  
 
 ![2D tracking preview](assets/mot16_challange.gif)
 
@@ -20,8 +23,17 @@ _video source: <https://motchallenge.net/data/MOT16/> - sequence 11_
 ### Latest release
 
 ```bash
-pip install motpy
+
+pip install git+https://github.com/kevin-tofu/motpy-smoother.git
+
 ```
+
+```bash
+
+poetry add git+https://github.com/kevin-tofu/motpy-smoother.git
+
+```
+
 
 #### Additional installation steps on Raspberry Pi
 
@@ -35,10 +47,8 @@ sudo apt install libatlas-base-dev
 ### Develop
 
 ```bash
-git clone https://github.com/wmuron/motpy
-cd motpy 
-make install-develop # to install editable version of library
-make test # to run all tests
+git clone https://github.com/kevin-tofu/motpy-smoother.git
+cd motpy-smoother
 ```
 
 ## Example usage
@@ -48,7 +58,9 @@ make test # to run all tests
 Run demo example of tracking N objects in 2D space. In the ideal world it will show a bunch of colorful objects moving on a grey canvas in various directions, sometimes overlapping, sometimes not. Each object is detected from time to time (green box) and once it's being tracked by motpy, its track box is drawn in red with an ID above.
 
 ```bash
+
 make demo
+
 ```
 
 <https://user-images.githubusercontent.com/5874874/134305624-d6358cb1-39f8-4499-8a7b-64745f4795a6.mp4>
