@@ -17,6 +17,7 @@ _video source: <https://motchallenge.net/data/MOT16/> - sequence 11_
     - each object is modeled as a center point (n-dimensional) and its size (n-dimensional); e.g. 2D position with width and height would be the most popular use case for bounding boxes tracking
     - seperately configurable system order for object position and size (currently 0th, 1st and 2nd order systems are allowed)
     - quite fast, more than realtime performance even on Raspberry Pi
+    - contains not only KalmanFilter but also KalmanSmoother(FixedLagSmoother)
 
 ## Installation
 
